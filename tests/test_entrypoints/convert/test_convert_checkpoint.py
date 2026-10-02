@@ -123,10 +123,11 @@ def test_convert_checkpoint_cpu_uses_dynamic_scheduler(
             job_memory_estimator=job_memory_estimator,
         )
 
-    # validation still runs through exec_jobs
+    # validation still runs through exec_jobs, with one worker per job (one job
+    # here) regardless of max_workers
     exec_jobs.assert_called_once()
     assert exec_jobs.call_args.kwargs == {"desc": "Validating"}
-    assert exec_jobs.call_args.args[1] == 2
+    assert exec_jobs.call_args.args[1] == 1
 
     # conversion is scheduled through exec_jobs_dynamic even on CPU, with zero
     # memory estimates and without invoking the profiler
@@ -235,6 +236,11 @@ def test_convert_checkpoint_rejects_empty_device_list(get_checkpoint_files, tmp_
         convert_checkpoint("source", tmp_path, Mock(), device=[])
 
     get_checkpoint_files.assert_not_called()
+
+
+def test_convert_checkpoint_defaults_to_auto_max_workers():
+    default = inspect.signature(convert_checkpoint).parameters["max_workers"].default
+    assert default == "auto"
 
 
 def test_convert_checkpoint_defaults_to_meta_estimator():
@@ -505,7 +511,7 @@ def test_convert_checkpoint_resolves_auto_max_workers(
         job_memory_estimator=Mock(return_value=123),
     )
 
-    # validation is bounded by the number of jobs and threads
+    # validation uses one worker per job, up to the thread limit
     assert exec_jobs.call_args.args[1] == min(len(shard_names), _max_threads())
 
     # conversion uses the value resolved from devices and memory estimates

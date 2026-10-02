@@ -42,7 +42,7 @@ def convert_checkpoint(
     model_stub: str | os.PathLike,
     save_directory: str | os.PathLike,
     converter: Converter | list[Converter],
-    max_workers: int | Literal["auto"] = 1,
+    max_workers: int | Literal["auto"] = "auto",
     device: str | torch.device | list[str | torch.device] | None = None,
     job_memory_estimator: Callable[
         [InverseWeightMap, list[Converter]], int
@@ -61,11 +61,11 @@ def convert_checkpoint(
     :param model_stub: huggingface model hub or path to local weights files
     :param save_directory: new checkpoint will be saved in this directory.
     :param max_workers: number of worker threads to process files with. If
-        "auto", the number of workers is chosen from the number of safetensors
-        files, the estimated memory of each conversion job, the free memory of
-        each accelerator, and the number of CPUs available to this process.
-        Host memory is not taken into account, so pass a smaller number of
-        workers if conversion runs out of host memory
+        "auto" (default), the number of workers is chosen from the number of
+        safetensors files, the estimated memory of each conversion job, the free
+        memory of each accelerator, and the number of CPUs available to this
+        process. Host memory is not taken into account, so pass a smaller number
+        of workers if conversion runs out of host memory
     :param device: device or devices on which to run conversion. When omitted,
         all available accelerator devices are used, falling back to CPU when no
         accelerator is available.
@@ -125,11 +125,9 @@ def convert_checkpoint(
                 shutil.copyfile(resolved_path, save_path)
 
     # Validate before long-running procssing job. Validation runs on meta tensors,
-    # so "auto" is only bounded by the number of jobs and threads
-    validate_workers = max_workers
-    if max_workers == "auto":
-        validate_workers = max(1, min(len(validate_jobs), _max_threads()))
-    exec_jobs(validate_jobs, validate_workers, desc="Validating")
+    # so it uses as many workers as possible, regardless of max_workers
+    num_validate_workers = max(1, min(len(validate_jobs), _max_threads()))
+    exec_jobs(validate_jobs, num_validate_workers, desc="Validating")
 
     # Process weights, accumulating total bytes used and the new weight_map.
     # exec_jobs_dynamic handles CPU natively (running sequentially), so the same
@@ -221,6 +219,8 @@ def _auto_max_workers(
     if num_jobs <= 1 or all(dev.type == "cpu" for dev in devices):
         return 1
 
+    # Assuming every job needs as much memory as the largest one, how many jobs fit
+    # in the free memory of all accelerators at once
     largest_job = max(memory_estimates)
     if largest_job > 0:
         free_memory = _snapshot_free(devices)
