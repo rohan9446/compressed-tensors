@@ -31,11 +31,17 @@ class OffloadBatch:
     recorded. On other ranks, tensors are recorded and rebuilt from the source's
     metadata when the batch completes. Entries are keyed by module and tensor name, so
     ranks which lack some modules (e.g. sharded experts) only rebuild their own.
+
+    The source rank is fixed when the batch is created.
     """
 
     def __init__(self):
+        self.source_rank = get_source_rank()
+        self.is_source = dist.get_rank() == self.source_rank
         # name of the module currently being offloaded, set by the caller
         self.module_name: str = ""
+        # keys recorded so far, to reject ambiguous (duplicate) keys
+        self.keys: set[tuple[str, Hashable]] = set()
         # source rank: (module name, tensor name) -> metadata to rebuild the offload
         self.metadata: dict[tuple[str, Hashable], Any] = {}
         # other ranks: offloads waiting for the source's metadata
@@ -61,7 +67,15 @@ class OffloadBatch:
             return None
 
         key = (self.module_name, name)
-        if is_source_process():
+        if key in self.keys:
+            raise ValueError(
+                f"Offload of `{name}` in module `{self.module_name}` was already "
+                "recorded in this batch. Set `module_name` before offloading each "
+                "module."
+            )
+        self.keys.add(key)
+
+        if self.is_source:
             offloaded, self.metadata[key] = cache.offload_local(tensor, memo=self.memo)
             return offloaded
 
@@ -74,10 +88,10 @@ class OffloadBatch:
         offloads on non-source ranks, then synchronize once so that the source keeps
         its offloads alive until every rank has rebuilt them
         """
-        payload = [self.metadata if is_source_process() else None]
-        dist.broadcast_object_list(payload, src=get_source_rank())
+        payload = [self.metadata if self.is_source else None]
+        dist.broadcast_object_list(payload, src=self.source_rank)
 
-        if not is_source_process():
+        if not self.is_source:
             metadata = payload[0]
             for cache, key, name, tensor in self.pending:
                 if key not in metadata:
@@ -102,17 +116,24 @@ def batch_offload_sync() -> Iterator[Optional[OffloadBatch]]:
     their metadata exchange until the context exits, so that offloading a whole model
     costs one broadcast and one barrier rather than one of each per tensor.
 
-    Yields `None` (and changes nothing) when not distributed or when a batch is
-    already active. Set `module_name` on the yielded batch before offloading each
-    module. Every rank must enter and exit the context together.
+    Yields `None` (and changes nothing) when not distributed. Set `module_name` on
+    the yielded batch before offloading each module. Every rank must enter and exit
+    the context together. The context is meant for serialized use by a single
+    dispatch, so it cannot be nested and is not thread-safe.
 
     Accelerator offloads are unaffected: they broadcast tensor data, not metadata.
     """
     global _active_batch
 
-    if not is_distributed() or _active_batch is not None:
+    if not is_distributed():
         yield None
         return
+
+    if _active_batch is not None:
+        raise RuntimeError(
+            "`batch_offload_sync` cannot be nested: offloads in the inner context "
+            "would join the outer batch under ambiguous names"
+        )
 
     batch = _active_batch = OffloadBatch()
     try:

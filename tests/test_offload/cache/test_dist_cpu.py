@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -215,3 +217,30 @@ def test_distributed_offload_logs_memory_hint(onload_device):
             "CPU offloading ran out of host RAM or mmap descriptors." in w
             for w in warnings
         )
+
+
+@pytest.mark.unit
+def test_recv_offload_logs_memory_hint():
+    # non-source ranks allocate and map shared memory too, so their failures
+    # should carry the same remediation hint as the source rank's
+    cache = DistributedCPUCache(torch.device("cpu"))
+    metadata = [b"handle", b"/torch_missing", 8, torch.float32, torch.Size([2])]
+
+    warnings = []
+    handler_id = loguru_logger.add(
+        lambda msg: warnings.append(msg.record["message"]), level="WARNING"
+    )
+    try:
+        with patch.object(
+            torch.UntypedStorage,
+            "_new_shared_filename_cpu",
+            side_effect=RuntimeError("mmap failed: Cannot allocate memory"),
+        ):
+            with pytest.raises(RuntimeError, match="Cannot allocate memory"):
+                cache.recv_offload(torch.zeros(2), metadata)
+    finally:
+        loguru_logger.remove(handler_id)
+
+    assert any(
+        "CPU offloading ran out of host RAM or mmap descriptors." in w for w in warnings
+    )

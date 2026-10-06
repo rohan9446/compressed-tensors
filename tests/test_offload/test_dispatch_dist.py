@@ -7,9 +7,12 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
-from compressed_tensors.distributed import is_source_process
+from compressed_tensors.distributed import is_source_process, set_source_process
 from compressed_tensors.offload import disable_onloading
+from compressed_tensors.offload.cache import dist_batch
+from compressed_tensors.offload.cache.dist_batch import batch_offload_sync
 from compressed_tensors.offload.dispatch import dispatch_with_map
+from compressed_tensors.offload.module import offload_module
 from tests.test_offload.conftest import torchrun
 from tests.testing_utils import requires_gpu
 
@@ -112,6 +115,16 @@ def test_dispatch_tied_weights(accel_device):
 
     _assert_matches(model, expected)
 
+    # an in-place update on the source reaches both aliases on every rank
+    if is_source_process():
+        with disable_onloading(), torch.no_grad():
+            model.embed.weight.fill_(1.0)
+    dist.barrier()
+
+    with torch.no_grad():
+        expected.embed.weight.fill_(1.0)
+    _assert_matches(model, expected)
+
 
 @pytest.mark.unit
 @requires_gpu(2)
@@ -172,3 +185,77 @@ def test_offload_after_dispatch_syncs_per_tensor(accel_device):
     assert broadcast_object_list.call_count == 1
     assert barrier.call_count == 1
     assert torch.equal(model[0].extra.cpu(), torch.full((3,), 7.0))
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_replica_without_local_modules(accel_device):
+    model = _linears(2, meta=not is_source_process())
+    if not is_source_process():
+        model[0] = None
+        model[1] = None
+
+    device_map = {str(i): (accel_device, CPU) for i in range(2)}
+    with _count_collectives() as (broadcast_object_list, barrier):
+        dispatch_with_map(model, device_map, show_progress=False)
+
+    # a rank with nothing to rebuild still joins the single exchange
+    assert broadcast_object_list.call_count == 1
+    assert barrier.call_count == 1
+    if is_source_process():
+        _assert_matches(model, _linears(2))
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_rejects_nested_batch(accel_device):
+    model = _linears(2, meta=not is_source_process())
+    device_map = {str(i): (accel_device, CPU) for i in range(2)}
+
+    with batch_offload_sync():
+        with pytest.raises(RuntimeError, match="cannot be nested"):
+            dispatch_with_map(model, device_map, show_progress=False)
+
+    assert dist_batch._active_batch is None
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_failed_batch_resets_state(accel_device):
+    model = _linears(2, meta=not is_source_process())
+
+    # without module names, both modules record `weight` under the same key
+    with pytest.raises(ValueError, match="already recorded"):
+        with batch_offload_sync():
+            for module in model:
+                offload_module(module, accel_device, CPU)
+
+    assert dist_batch._active_batch is None
+
+    # a later, independent dispatch is unaffected
+    model = _linears(2, meta=not is_source_process())
+    device_map = {str(i): (accel_device, CPU) for i in range(2)}
+    dispatch_with_map(model, device_map, show_progress=False)
+    _assert_matches(model, _linears(2))
+
+
+@pytest.mark.unit
+@requires_gpu(3)
+@torchrun(world_size=3, init_dist=True)
+def test_dispatch_three_ranks_non_default_source(accel_device, offload_folder):
+    with set_source_process(1):
+        for offload_device in (CPU, "disk"):
+            model = _linears(4, meta=not is_source_process())
+            device_map = {str(i): (accel_device, offload_device) for i in range(4)}
+
+            with _count_collectives() as (broadcast_object_list, barrier):
+                dispatch_with_map(
+                    model, device_map, offload_dir=offload_folder, show_progress=False
+                )
+
+            assert broadcast_object_list.call_count == 1
+            assert barrier.call_count == 1
+            _assert_matches(model, _linears(4))

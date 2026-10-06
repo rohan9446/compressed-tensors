@@ -49,6 +49,7 @@ class DistributedCPUCache(BatchedOffloadMixin, CPUCache):
 
         return tensor, [*handle, tensor.dtype, tensor.shape]
 
+    @catch_cpu_mem_error
     def recv_offload(
         self, tensor: torch.Tensor, metadata: list, memo: Optional[dict] = None
     ) -> torch.Tensor:
