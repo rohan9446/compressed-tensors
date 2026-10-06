@@ -115,6 +115,10 @@ def test_dispatch_tied_weights(accel_device):
 
     _assert_matches(model, expected)
 
+    # every rank finishes checking the original values before the source mutates
+    # the shared storage
+    dist.barrier()
+
     # an in-place update on the source reaches both aliases on every rank
     if is_source_process():
         with disable_onloading(), torch.no_grad():
