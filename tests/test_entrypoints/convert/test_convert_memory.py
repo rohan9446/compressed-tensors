@@ -3,6 +3,8 @@
 
 import functools
 import inspect
+import threading
+import time
 from contextlib import contextmanager
 from threading import get_ident, local
 from unittest.mock import patch
@@ -12,9 +14,12 @@ import torch
 from compressed_tensors.entrypoints.convert.memory import (
     _FALLBACK_MULTIPLIER,
     TensorProfiler,
+    _cgroup_available_bytes,
     _free_bytes,
+    _host_available_bytes,
     _pick_device,
     _run_job_on_device,
+    _snapshot_free,
     estimate_job_memory,
     exec_jobs_dynamic,
 )
@@ -25,6 +30,7 @@ _LOAD_TARGET = (
     "compressed_tensors.entrypoints.convert.memory."
     "load_tensors_from_inverse_weight_map"
 )
+_HOST_TARGET = "compressed_tensors.entrypoints.convert.memory._host_available_bytes"
 _PATCH_TARGET = (
     "compressed_tensors.entrypoints.convert.memory"
     ".torch.accelerator.memory.get_memory_info"
@@ -220,6 +226,117 @@ def test_cpu_path_preserves_order():
     jobs = [lambda dev, i=i: i for i in range(10)]
     out = exec_jobs_dynamic(jobs, [torch.device("cpu")], 4, [100] * 10)
     assert out == list(range(10))
+
+
+def _run_tracked(num_jobs, max_workers, estimate):
+    """Run sleeping cpu jobs and return how many ran at once, at most"""
+    lock, active, peak = threading.Lock(), [0], [0]
+
+    def job(dev):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.2)
+        with lock:
+            active[0] -= 1
+        return dev
+
+    out = exec_jobs_dynamic(
+        [job] * num_jobs, [torch.device("cpu")], max_workers, [estimate] * num_jobs
+    )
+    assert out == [torch.device("cpu")] * num_jobs
+    return peak[0]
+
+
+@patch(_HOST_TARGET, return_value=10**12)
+def test_cpu_runs_up_to_max_workers_concurrently(_):
+    assert _run_tracked(num_jobs=6, max_workers=2, estimate=1) == 2
+
+
+@patch(_HOST_TARGET, return_value=1000)
+def test_cpu_concurrency_is_limited_by_host_memory(_):
+    # only three 300-byte jobs fit in 1000 bytes, despite max_workers=4
+    assert _run_tracked(num_jobs=6, max_workers=4, estimate=300) == 3
+
+
+@patch(_HOST_TARGET, return_value=100)
+def test_cpu_raises_when_job_exceeds_host_memory(_):
+    cpu = torch.device("cpu")
+    with pytest.raises(RuntimeError, match="exceeds estimated capacity"):
+        exec_jobs_dynamic([lambda dev: None], [cpu], 1, [1000])
+    with pytest.raises(RuntimeError, match="No device has enough"):
+        exec_jobs_dynamic([lambda dev: None], [cpu], 2, [1000])
+
+
+# ── host memory ────────────────────────────────────────────────────────
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_cgroup_v2_available_bytes(tmp_path):
+    _write(tmp_path / "proc", "0::/\n")
+    _write(tmp_path / "cg" / "memory.max", "1000\n")
+    _write(tmp_path / "cg" / "memory.current", "600\n")
+    _write(tmp_path / "cg" / "memory.stat", "anon 400\ninactive_file 100\n")
+    # limit - (usage - reclaimable inactive file cache)
+    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 500
+
+
+def test_cgroup_v2_takes_smallest_headroom_over_ancestors(tmp_path):
+    _write(tmp_path / "proc", "0::/a/b\n")
+    _write(tmp_path / "cg" / "a" / "b" / "memory.max", "max\n")
+    _write(tmp_path / "cg" / "a" / "b" / "memory.current", "300\n")
+    _write(tmp_path / "cg" / "a" / "memory.max", "800\n")
+    _write(tmp_path / "cg" / "a" / "memory.current", "700\n")
+    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 100
+
+
+def test_cgroup_v2_without_limit(tmp_path):
+    _write(tmp_path / "proc", "0::/\n")
+    _write(tmp_path / "cg" / "memory.max", "max\n")
+    _write(tmp_path / "cg" / "memory.current", "600\n")
+    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") is None
+
+
+def test_cgroup_v1_memory_controller(tmp_path):
+    # hybrid hierarchy: the v1 memory controller takes precedence
+    _write(tmp_path / "proc", "12:memory:/docker/abc\n0::/\n")
+    leaf = tmp_path / "cg" / "memory" / "docker" / "abc"
+    _write(leaf / "memory.limit_in_bytes", "2000\n")
+    _write(leaf / "memory.usage_in_bytes", "1500\n")
+    _write(leaf / "memory.stat", "total_inactive_file 500\n")
+    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 1000
+
+
+def test_cgroup_unavailable(tmp_path):
+    assert _cgroup_available_bytes(tmp_path / "missing", tmp_path / "cg") is None
+
+
+@pytest.mark.parametrize(("cgroup", "expected"), ((32, 32), (None, 512)))
+def test_host_available_bytes_capped_by_cgroup(cgroup, expected):
+    module = "compressed_tensors.entrypoints.convert.memory"
+    with (
+        patch(f"{module}.psutil.virtual_memory") as virtual_memory,
+        patch(f"{module}._cgroup_available_bytes", return_value=cgroup),
+    ):
+        virtual_memory.return_value.available = 512
+        assert _host_available_bytes() == expected
+
+
+@patch(_HOST_TARGET, return_value=123)
+def test_snapshot_free_cpu_only_reports_host_memory(_):
+    cpu = torch.device("cpu")
+    assert _snapshot_free([cpu]) == {cpu: 123}
+
+
+@patch(_HOST_TARGET, return_value=123)
+@patch(_PATCH_TARGET, return_value=(456, 1000))
+def test_snapshot_free_skips_cpu_alongside_accelerators(*_):
+    cpu, cuda = torch.device("cpu"), torch.device("cuda:0")
+    assert _snapshot_free([cuda, cpu]) == {cuda: 456}
 
 
 # ── exec_jobs_dynamic: input validation ───────────────────────────────

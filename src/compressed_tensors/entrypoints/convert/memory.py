@@ -8,9 +8,11 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from functools import partial
+from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Optional
 
+import psutil
 import torch
 import tqdm
 from compressed_tensors.utils.safetensors_load import (
@@ -199,13 +201,108 @@ def estimate_job_memory(
     return prof.memory_peak[meta]
 
 
+def _read_int(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _read_stat(path: Path, key: str) -> int:
+    try:
+        for line in path.read_text().splitlines():
+            name, _, value = line.partition(" ")
+            if name == key:
+                return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _cgroup_available_bytes(
+    proc_cgroup: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> Optional[int]:
+    """
+    Memory this process can still allocate under its cgroup memory limits: the
+    smallest `limit - (usage - inactive file cache)` over the process's cgroup and
+    its ancestors. Supports cgroup v2 and the v1 memory controller.
+
+    :return: available bytes, or None if no cgroup memory limit could be read
+    """
+    try:
+        lines = proc_cgroup.read_text().splitlines()
+    except OSError:
+        return None
+
+    # each line is "hierarchy-id:controller-list:path"
+    entries = [line.split(":", 2) for line in lines if line.count(":") >= 2]
+
+    v1 = [
+        path for _, controllers, path in entries if "memory" in controllers.split(",")
+    ]
+    v2 = [path for hierarchy, _, path in entries if hierarchy == "0"]
+    if v1:
+        base, path = cgroup_root / "memory", v1[0]
+        files = (
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            "total_inactive_file",
+        )
+    elif v2:
+        base, path = cgroup_root, v2[0]
+        files = ("memory.max", "memory.current", "inactive_file")
+    else:
+        return None
+
+    limit_file, usage_file, inactive_key = files
+    available = None
+    leaf = base / path.lstrip("/")
+    for directory in (leaf, *leaf.parents):
+        # cgroup v2 reports "max" when there is no limit, which is skipped here
+        limit = _read_int(directory / limit_file)
+        usage = _read_int(directory / usage_file)
+        if limit is not None and usage is not None:
+            # page cache counts as usage, but inactive file pages are reclaimable
+            inactive = _read_stat(directory / "memory.stat", inactive_key)
+            headroom = max(0, limit - max(0, usage - inactive))
+            available = headroom if available is None else min(available, headroom)
+        if directory == base:
+            break
+
+    return available
+
+
+def _host_available_bytes() -> int:
+    """
+    Host memory available to this process: the system's available memory, capped
+    by any cgroup memory limit. Inside a container, psutil alone reports the memory
+    of the whole host rather than the container's limit.
+    """
+    available = psutil.virtual_memory().available
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        available = min(available, cgroup_available)
+    return available
+
+
 def _snapshot_free(devices: list[torch.device]) -> dict[torch.device, int]:
-    """Query free VRAM once per device. CPU devices are skipped."""
+    """
+    Query free memory once per device. Accelerators report free device memory.
+    When every device is the cpu, the cpu reports the host memory available to this
+    process; otherwise cpu devices are skipped, so that host memory does not draw
+    jobs away from the accelerators.
+    """
+    cpu_only = all(d.type == "cpu" for d in devices)
     free = {}
     for d in devices:
-        if d.type != "cpu" and d not in free:
+        if d in free:
+            continue
+        if d.type != "cpu":
             mem_free, _ = torch.accelerator.memory.get_memory_info(d)
             free[d] = mem_free
+        elif cpu_only:
+            free[d] = _host_available_bytes()
     return free
 
 
@@ -214,12 +311,10 @@ def _free_bytes(
     initial_free: dict[torch.device, int],
     reserved: dict[torch.device, int],
 ) -> int:
-    """Available VRAM for *dev*: initial snapshot minus in-flight reservations.
+    """Available memory for *dev*: initial snapshot minus in-flight reservations.
 
-    CPU devices are not present in *initial_free* (skipped by
-    ``_snapshot_free``), so they always return 0 and are never picked by
-    ``_pick_device``. The CPU-only path is handled separately in
-    ``exec_jobs_dynamic`` before any scheduling logic runs.
+    Devices missing from *initial_free* (cpu devices alongside accelerators, see
+    ``_snapshot_free``) return 0 and are never picked by ``_pick_device``.
     """
     return max(0, initial_free.get(dev, 0) - reserved.get(dev, 0))
 
@@ -230,7 +325,7 @@ def _pick_device(
     initial_free: dict[torch.device, int],
     reserved: dict[torch.device, int],
 ) -> torch.device | None:
-    """Return the device with the most available VRAM that can fit *required*
+    """Return the device with the most available memory that can fit *required*
     bytes, or ``None`` if nothing qualifies."""
     best, best_free = None, -1
     for dev in devices:
@@ -266,14 +361,14 @@ def exec_jobs_dynamic(
     desc: str = "Processing",
 ) -> list:
     """Run *jobs* across *devices*, assigning each job at submit time to
-    whichever GPU has the most free memory.
+    whichever device has the most free memory.
 
     Each job is a callable that accepts a single ``torch.device`` argument and
-    returns its result. Free VRAM is queried once at startup; subsequent
-    scheduling decisions rely on reservation accounting so we never re-query
-    the driver in a hot loop. Effective concurrency is capped by estimated GPU
-    capacity: even if ``max_workers`` is high, jobs are held back until a GPU
-    can actually fit the estimated footprint.
+    returns its result. Free memory is queried once at startup (host memory for
+    cpu-only runs, see ``_snapshot_free``); subsequent scheduling decisions rely on
+    reservation accounting so we never re-query in a hot loop. Effective
+    concurrency is capped by estimated capacity: even if ``max_workers`` is high,
+    jobs are held back until a device can actually fit the estimated footprint.
 
     :param jobs: list of callables, each accepting a device and returning a result
     :param devices: list of devices to schedule across
@@ -301,14 +396,7 @@ def exec_jobs_dynamic(
     if n > 0 and not devices:
         raise ValueError("devices must not be empty when jobs are provided")
 
-    # CPU path: run sequentially regardless of max_workers
-    if all(d.type == "cpu" for d in devices):
-        out = []
-        for job in tqdm.tqdm(jobs, desc=desc):
-            out.append(_run_job_on_device(job, devices[0]))
-        return out
-
-    # Snapshot free VRAM once; all later decisions use accounting only
+    # Snapshot free memory once; all later decisions use accounting only
     initial_free = _snapshot_free(devices)
     if not initial_free:
         raise RuntimeError(
