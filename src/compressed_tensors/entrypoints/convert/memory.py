@@ -8,7 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -201,6 +201,15 @@ def estimate_job_memory(
     return prof.memory_peak[meta]
 
 
+# limit file, usage file and reclaimable `memory.stat` key of each cgroup version
+_V1_MEMORY_FILES = (
+    "memory.limit_in_bytes",
+    "memory.usage_in_bytes",
+    "total_inactive_file",
+)
+_V2_MEMORY_FILES = ("memory.max", "memory.current", "inactive_file")
+
+
 def _read_int(path: Path) -> Optional[int]:
     try:
         return int(path.read_text().split()[0])
@@ -221,43 +230,74 @@ def _read_stat(path: Path, key: str) -> int:
 
 def _cgroup_available_bytes(
     proc_cgroup: Path = Path("/proc/self/cgroup"),
-    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    mountinfo: Path = Path("/proc/self/mountinfo"),
 ) -> Optional[int]:
     """
-    Memory this process can still allocate under its cgroup memory limits: the
-    smallest `limit - (usage - inactive file cache)` over the process's cgroup and
-    its ancestors. Supports cgroup v2 and the v1 memory controller.
+    Estimated memory this process can still allocate under the cgroup memory limits
+    it can read: the smallest `limit - (usage - inactive file cache)` over the
+    process's cgroup and its ancestors that are visible through the cgroup mount.
+    Supports cgroup v2 and the v1 memory controller. Ancestors outside the mount
+    (e.g. above a container's cgroup namespace) cannot be read, so their limits and
+    their other members' usage are not taken into account.
 
     :return: available bytes, or None if no cgroup memory limit could be read
     """
     try:
-        lines = proc_cgroup.read_text().splitlines()
+        cgroup_lines = proc_cgroup.read_text().splitlines()
+        mount_lines = mountinfo.read_text().splitlines()
     except OSError:
         return None
 
-    # each line is "hierarchy-id:controller-list:path"
-    entries = [line.split(":", 2) for line in lines if line.count(":") >= 2]
+    # each cgroup line is "hierarchy-id:controller-list:path"
+    entries = [line.split(":", 2) for line in cgroup_lines if line.count(":") >= 2]
+    # each mountinfo line is "id parent-id major:minor root mount-point options
+    # [optional fields...] - fs-type source super-options"
+    mounts = []
+    for line in mount_lines:
+        fields, _, fs_fields = line.partition(" - ")
+        fields, fs_fields = fields.split(), fs_fields.split()
+        if len(fields) >= 5 and len(fs_fields) >= 3:
+            mounts.append((fs_fields[0], fs_fields[2].split(","), fields[3], fields[4]))
 
     v1 = [
         path for _, controllers, path in entries if "memory" in controllers.split(",")
     ]
     v2 = [path for hierarchy, _, path in entries if hierarchy == "0"]
     if v1:
-        base, path = cgroup_root / "memory", v1[0]
-        files = (
-            "memory.limit_in_bytes",
-            "memory.usage_in_bytes",
-            "total_inactive_file",
-        )
+        path, files = v1[0], _V1_MEMORY_FILES
+        candidates = [
+            (root, point)
+            for fs_type, options, root, point in mounts
+            if fs_type == "cgroup" and "memory" in options
+        ]
     elif v2:
-        base, path = cgroup_root, v2[0]
-        files = ("memory.max", "memory.current", "inactive_file")
+        path, files = v2[0], _V2_MEMORY_FILES
+        candidates = [
+            (root, point) for fs_type, _, root, point in mounts if fs_type == "cgroup2"
+        ]
     else:
         return None
 
-    limit_file, usage_file, inactive_key = files
+    # a mount exposes the hierarchy below its root, so resolve the process's cgroup
+    # relative to that root; prefer the mount that exposes the most ancestors
+    for root, point in sorted(candidates, key=lambda candidate: len(candidate[0])):
+        try:
+            relative = PurePosixPath(path).relative_to(root)
+        except ValueError:
+            continue
+        mount_point = Path(point)
+        leaf = mount_point / relative
+        if leaf.is_dir():
+            return _cgroup_headroom(leaf, mount_point, *files)
+
+    return None
+
+
+def _cgroup_headroom(
+    leaf: Path, mount_point: Path, limit_file: str, usage_file: str, inactive_key: str
+) -> Optional[int]:
+    """Smallest headroom over `leaf` and its ancestors up to `mount_point`"""
     available = None
-    leaf = base / path.lstrip("/")
     for directory in (leaf, *leaf.parents):
         # cgroup v2 reports "max" when there is no limit, which is skipped here
         limit = _read_int(directory / limit_file)
@@ -267,7 +307,7 @@ def _cgroup_available_bytes(
             inactive = _read_stat(directory / "memory.stat", inactive_key)
             headroom = max(0, limit - max(0, usage - inactive))
             available = headroom if available is None else min(available, headroom)
-        if directory == base:
+        if directory == mount_point:
             break
 
     return available
@@ -275,8 +315,9 @@ def _cgroup_available_bytes(
 
 def _host_available_bytes() -> int:
     """
-    Host memory available to this process: the system's available memory, capped
-    by any cgroup memory limit. Inside a container, psutil alone reports the memory
+    Estimated host memory available to this process: the system's available memory,
+    capped by the cgroup memory limits this process can read (see
+    `_cgroup_available_bytes`). Inside a container, psutil alone reports the memory
     of the whole host rather than the container's limit.
     """
     available = psutil.virtual_memory().available
@@ -366,9 +407,12 @@ def exec_jobs_dynamic(
     Each job is a callable that accepts a single ``torch.device`` argument and
     returns its result. Free memory is queried once at startup (host memory for
     cpu-only runs, see ``_snapshot_free``); subsequent scheduling decisions rely on
-    reservation accounting so we never re-query in a hot loop. Effective
+    reservation accounting so we never re-query in a hot loop. Reservations track
+    the estimates of this call's in-flight jobs against that initial snapshot, so
+    memory used or freed by anything else afterwards is not seen. Effective
     concurrency is capped by estimated capacity: even if ``max_workers`` is high,
     jobs are held back until a device can actually fit the estimated footprint.
+    All cpu devices share the same host memory, so they are scheduled as one device.
 
     :param jobs: list of callables, each accepting a device and returning a result
     :param devices: list of devices to schedule across
@@ -378,9 +422,10 @@ def exec_jobs_dynamic(
     :return: list of results in the same order as *jobs*
     :raises ValueError: if inputs are invalid (length mismatch, negative estimates,
         max_workers < 1, or empty devices with non-empty jobs)
-    :raises RuntimeError: if no device has enough estimated free memory for a job.
-        Note: if a worker raises mid-run, the ThreadPoolExecutor drains all
-        in-flight jobs before the exception surfaces to the caller.
+    :raises RuntimeError: if a job's estimate exceeds the free memory of every
+        device, before any job runs. Note: if a worker raises mid-run, the
+        ThreadPoolExecutor drains all in-flight jobs before the exception surfaces
+        to the caller.
     """
     n = len(jobs)
 
@@ -395,6 +440,11 @@ def exec_jobs_dynamic(
         raise ValueError(f"max_workers must be at least 1, got {max_workers}")
     if n > 0 and not devices:
         raise ValueError("devices must not be empty when jobs are provided")
+    if n == 0:
+        return []
+
+    # cpu aliases (e.g. "cpu" and "cpu:0") draw on one host memory budget
+    devices = [torch.device("cpu") if d.type == "cpu" else d for d in devices]
 
     # Snapshot free memory once; all later decisions use accounting only
     initial_free = _snapshot_free(devices)
@@ -404,18 +454,20 @@ def exec_jobs_dynamic(
             "Ensure at least one non-CPU device is accessible."
         )
 
+    # Reject jobs that cannot fit on any device before converting anything
+    capacity = max(initial_free.values())
+    for i, estimate in enumerate(memory_estimates):
+        if estimate > capacity:
+            raise RuntimeError(
+                f"Job {i} needs an estimated {estimate / 1e9:.2f} GB, which exceeds "
+                f"the estimated free memory of every device (at most "
+                f"{capacity / 1e9:.2f} GB)"
+            )
+
     # Single worker: pick the best device once upfront
     if max_workers == 1:
         device = max(initial_free, key=initial_free.get)
-        out = []
-        for i, job in enumerate(tqdm.tqdm(jobs, desc=desc)):
-            if memory_estimates[i] > initial_free[device]:
-                raise RuntimeError(
-                    f"Job {i} (~{memory_estimates[i] / 1e9:.2f} GB) "
-                    f"exceeds estimated capacity of {device}"
-                )
-            out.append(_run_job_on_device(job, device))
-        return out
+        return [_run_job_on_device(job, device) for job in tqdm.tqdm(jobs, desc=desc)]
 
     # Multi-worker: main thread schedules, workers execute
     reserved = {d: 0 for d in devices}
@@ -456,8 +508,7 @@ def exec_jobs_dynamic(
                     break
                 raise RuntimeError(
                     "No device has enough estimated free memory for any "
-                    "remaining job. Consider reducing max_workers or "
-                    "increasing the memory estimate multiplier."
+                    "remaining job"
                 )
 
             done, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)

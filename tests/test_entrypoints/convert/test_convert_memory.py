@@ -3,8 +3,7 @@
 
 import functools
 import inspect
-import threading
-import time
+from concurrent.futures import wait
 from contextlib import contextmanager
 from threading import get_ident, local
 from unittest.mock import patch
@@ -31,6 +30,7 @@ _LOAD_TARGET = (
     "load_tensors_from_inverse_weight_map"
 )
 _HOST_TARGET = "compressed_tensors.entrypoints.convert.memory._host_available_bytes"
+_WAIT_TARGET = "compressed_tensors.entrypoints.convert.memory.wait"
 _PATCH_TARGET = (
     "compressed_tensors.entrypoints.convert.memory"
     ".torch.accelerator.memory.get_memory_info"
@@ -207,7 +207,8 @@ def test_dynamic_scheduler_selects_device_in_worker_threads():
 # ── exec_jobs_dynamic: CPU path (no GPU required) ──────────────────────
 
 
-def test_cpu_path_runs_all_jobs():
+@patch(_HOST_TARGET, return_value=10**12)
+def test_cpu_path_runs_all_jobs(_):
     results = exec_jobs_dynamic(
         jobs=[lambda dev: dev for _ in range(5)],
         devices=[torch.device("cpu")],
@@ -220,52 +221,57 @@ def test_cpu_path_runs_all_jobs():
 
 def test_cpu_path_empty_jobs():
     assert exec_jobs_dynamic([], [torch.device("cpu")], 1, []) == []
+    assert exec_jobs_dynamic([], [], 1, []) == []
 
 
-def test_cpu_path_preserves_order():
+@patch(_HOST_TARGET, return_value=10**12)
+def test_cpu_path_preserves_order(_):
     jobs = [lambda dev, i=i: i for i in range(10)]
     out = exec_jobs_dynamic(jobs, [torch.device("cpu")], 4, [100] * 10)
     assert out == list(range(10))
 
 
-def _run_tracked(num_jobs, max_workers, estimate):
-    """Run sleeping cpu jobs and return how many ran at once, at most"""
-    lock, active, peak = threading.Lock(), [0], [0]
+def _max_in_flight(devices, max_workers, estimates):
+    """Run cpu jobs and return the most jobs the scheduler had in flight at once"""
+    in_flight = []
 
-    def job(dev):
-        with lock:
-            active[0] += 1
-            peak[0] = max(peak[0], active[0])
-        time.sleep(0.2)
-        with lock:
-            active[0] -= 1
-        return dev
+    def recording_wait(futures, **kwargs):
+        in_flight.append(len(futures))
+        return wait(futures, **kwargs)
 
-    out = exec_jobs_dynamic(
-        [job] * num_jobs, [torch.device("cpu")], max_workers, [estimate] * num_jobs
-    )
-    assert out == [torch.device("cpu")] * num_jobs
-    return peak[0]
+    with patch(_WAIT_TARGET, side_effect=recording_wait):
+        out = exec_jobs_dynamic(
+            [lambda dev: dev] * len(estimates), devices, max_workers, estimates
+        )
+    assert out == [torch.device("cpu")] * len(estimates)
+    return max(in_flight)
 
 
 @patch(_HOST_TARGET, return_value=10**12)
 def test_cpu_runs_up_to_max_workers_concurrently(_):
-    assert _run_tracked(num_jobs=6, max_workers=2, estimate=1) == 2
+    assert _max_in_flight([torch.device("cpu")], 2, [1] * 6) == 2
 
 
 @patch(_HOST_TARGET, return_value=1000)
 def test_cpu_concurrency_is_limited_by_host_memory(_):
     # only three 300-byte jobs fit in 1000 bytes, despite max_workers=4
-    assert _run_tracked(num_jobs=6, max_workers=4, estimate=300) == 3
+    assert _max_in_flight([torch.device("cpu")], 4, [300] * 6) == 3
 
 
+@patch(_HOST_TARGET, return_value=1000)
+def test_cpu_aliases_share_one_host_memory_budget(_):
+    devices = [torch.device("cpu"), torch.device("cpu:0")]
+    assert _max_in_flight(devices, 2, [800, 800]) == 1
+
+
+@pytest.mark.parametrize("max_workers", (1, 2))
 @patch(_HOST_TARGET, return_value=100)
-def test_cpu_raises_when_job_exceeds_host_memory(_):
-    cpu = torch.device("cpu")
-    with pytest.raises(RuntimeError, match="exceeds estimated capacity"):
-        exec_jobs_dynamic([lambda dev: None], [cpu], 1, [1000])
-    with pytest.raises(RuntimeError, match="No device has enough"):
-        exec_jobs_dynamic([lambda dev: None], [cpu], 2, [1000])
+def test_cpu_raises_before_running_jobs_that_exceed_host_memory(_, max_workers):
+    ran = []
+    jobs = [lambda dev: ran.append(0), lambda dev: ran.append(1)]
+    with pytest.raises(RuntimeError, match="Job 1 needs an estimated"):
+        exec_jobs_dynamic(jobs, [torch.device("cpu")], max_workers, [10, 1000])
+    assert ran == []
 
 
 # ── host memory ────────────────────────────────────────────────────────
@@ -276,43 +282,92 @@ def _write(path, text):
     path.write_text(text)
 
 
+def _proc_files(tmp_path, cgroup, *mounts):
+    """
+    Write /proc/self/cgroup and /proc/self/mountinfo stand-ins. Each mount is
+    (fs-type, root, mount point, super options).
+    """
+    _write(tmp_path / "proc" / "cgroup", cgroup)
+    _write(
+        tmp_path / "proc" / "mountinfo",
+        "".join(
+            f"{30 + i} 1 0:{30 + i} {root} {point} rw shared:{i} - {fs} {fs} {opts}\n"
+            for i, (fs, root, point, opts) in enumerate(mounts)
+        ),
+    )
+    return tmp_path / "proc" / "cgroup", tmp_path / "proc" / "mountinfo"
+
+
 def test_cgroup_v2_available_bytes(tmp_path):
-    _write(tmp_path / "proc", "0::/\n")
-    _write(tmp_path / "cg" / "memory.max", "1000\n")
-    _write(tmp_path / "cg" / "memory.current", "600\n")
-    _write(tmp_path / "cg" / "memory.stat", "anon 400\ninactive_file 100\n")
+    cg = tmp_path / "cg"
+    _write(cg / "memory.max", "1000\n")
+    _write(cg / "memory.current", "600\n")
+    _write(cg / "memory.stat", "anon 400\ninactive_file 100\n")
+    files = _proc_files(tmp_path, "0::/\n", ("cgroup2", "/", cg, "rw"))
     # limit - (usage - reclaimable inactive file cache)
-    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 500
+    assert _cgroup_available_bytes(*files) == 500
 
 
 def test_cgroup_v2_takes_smallest_headroom_over_ancestors(tmp_path):
-    _write(tmp_path / "proc", "0::/a/b\n")
-    _write(tmp_path / "cg" / "a" / "b" / "memory.max", "max\n")
-    _write(tmp_path / "cg" / "a" / "b" / "memory.current", "300\n")
-    _write(tmp_path / "cg" / "a" / "memory.max", "800\n")
-    _write(tmp_path / "cg" / "a" / "memory.current", "700\n")
-    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 100
+    cg = tmp_path / "cg"
+    _write(cg / "a" / "b" / "memory.max", "max\n")
+    _write(cg / "a" / "b" / "memory.current", "300\n")
+    _write(cg / "a" / "memory.max", "800\n")
+    _write(cg / "a" / "memory.current", "700\n")
+    files = _proc_files(tmp_path, "0::/a/b\n", ("cgroup2", "/", cg, "rw"))
+    assert _cgroup_available_bytes(*files) == 100
+
+
+def test_cgroup_v2_mount_of_a_subtree(tmp_path):
+    # the mount exposes /tenant, so the process's /tenant/job is cg/job, whose
+    # tighter limit must not be missed
+    cg = tmp_path / "cg"
+    _write(cg / "memory.max", "8000\n")
+    _write(cg / "memory.current", "1000\n")
+    _write(cg / "job" / "memory.max", "1500\n")
+    _write(cg / "job" / "memory.current", "500\n")
+    files = _proc_files(tmp_path, "0::/tenant/job\n", ("cgroup2", "/tenant", cg, "rw"))
+    assert _cgroup_available_bytes(*files) == 1000
+
+
+def test_cgroup_not_visible_through_mount(tmp_path):
+    cg = tmp_path / "cg"
+    _write(cg / "memory.max", "1000\n")
+    _write(cg / "memory.current", "600\n")
+    files = _proc_files(tmp_path, "0::/other\n", ("cgroup2", "/tenant", cg, "rw"))
+    assert _cgroup_available_bytes(*files) is None
 
 
 def test_cgroup_v2_without_limit(tmp_path):
-    _write(tmp_path / "proc", "0::/\n")
-    _write(tmp_path / "cg" / "memory.max", "max\n")
-    _write(tmp_path / "cg" / "memory.current", "600\n")
-    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") is None
+    cg = tmp_path / "cg"
+    _write(cg / "memory.max", "max\n")
+    _write(cg / "memory.current", "600\n")
+    files = _proc_files(tmp_path, "0::/\n", ("cgroup2", "/", cg, "rw"))
+    assert _cgroup_available_bytes(*files) is None
 
 
-def test_cgroup_v1_memory_controller(tmp_path):
-    # hybrid hierarchy: the v1 memory controller takes precedence
-    _write(tmp_path / "proc", "12:memory:/docker/abc\n0::/\n")
-    leaf = tmp_path / "cg" / "memory" / "docker" / "abc"
+@pytest.mark.parametrize("controllers", ("memory", "cpu,memory"))
+def test_cgroup_v1_memory_controller(tmp_path, controllers):
+    # hybrid hierarchy: the v1 memory controller, possibly mounted together with
+    # other controllers, takes precedence over the v2 hierarchy
+    v1, v2 = tmp_path / controllers, tmp_path / "unified"
+    leaf = v1 / "docker" / "abc"
     _write(leaf / "memory.limit_in_bytes", "2000\n")
     _write(leaf / "memory.usage_in_bytes", "1500\n")
     _write(leaf / "memory.stat", "total_inactive_file 500\n")
-    assert _cgroup_available_bytes(tmp_path / "proc", tmp_path / "cg") == 1000
+    _write(v2 / "memory.max", "100\n")
+    _write(v2 / "memory.current", "0\n")
+    files = _proc_files(
+        tmp_path,
+        f"12:{controllers}:/docker/abc\n0::/\n",
+        ("cgroup2", "/", v2, "rw"),
+        ("cgroup", "/", v1, f"rw,{controllers}"),
+    )
+    assert _cgroup_available_bytes(*files) == 1000
 
 
 def test_cgroup_unavailable(tmp_path):
-    assert _cgroup_available_bytes(tmp_path / "missing", tmp_path / "cg") is None
+    assert _cgroup_available_bytes(tmp_path / "cgroup", tmp_path / "mountinfo") is None
 
 
 @pytest.mark.parametrize(("cgroup", "expected"), ((32, 32), (None, 512)))
@@ -368,7 +423,7 @@ def test_raises_on_empty_devices_with_jobs():
 @patch(_PATCH_TARGET)
 def test_raises_when_no_device_fits(mock_mem_info):
     mock_mem_info.return_value = (1000, 96_000_000_000)
-    with pytest.raises(RuntimeError, match="No device has enough"):
+    with pytest.raises(RuntimeError, match="exceeds the estimated free memory"):
         exec_jobs_dynamic(
             jobs=[lambda dev: None],
             devices=[torch.device("cuda:0")],
@@ -380,7 +435,7 @@ def test_raises_when_no_device_fits(mock_mem_info):
 @patch(_PATCH_TARGET)
 def test_single_worker_raises_when_job_exceeds_capacity(mock_mem_info):
     mock_mem_info.return_value = (1000, 96_000_000_000)
-    with pytest.raises(RuntimeError, match="exceeds estimated capacity"):
+    with pytest.raises(RuntimeError, match="exceeds the estimated free memory"):
         exec_jobs_dynamic(
             jobs=[lambda dev: None],
             devices=[torch.device("cuda:0")],

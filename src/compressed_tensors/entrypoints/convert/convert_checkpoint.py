@@ -77,7 +77,9 @@ def convert_checkpoint(
         accelerator is available.
     :param job_memory_estimator: callable returning the estimated memory in bytes
         for a conversion job, given its inverse weight map and the converters to
-        apply. Defaults to a meta-tensor profiler.
+        apply. Defaults to a meta-tensor profiler. On cpu, estimates are scaled
+        by a safety margin. Conversion raises before any file is converted if a
+        job's estimate exceeds the free memory of every device
     :param converter: single converter or list of converters to apply
         in order, e.g. a dequantizer followed by a re-quantizer
     """
