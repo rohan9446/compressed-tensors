@@ -289,16 +289,20 @@ def _cgroup_available_bytes(
     else:
         return None
 
+    # cgroups outside this process's cgroup namespace are shown with ".."
+    if ".." in PurePosixPath(path).parts:
+        return None
+
     # a mount exposes the hierarchy below its root, so resolve the process's cgroup
     # relative to that root. Mounts may expose different parts of the hierarchy or
     # hide some files, so take the smallest headroom over all of them
     available = None
     for root, point in candidates:
+        if ".." in PurePosixPath(root).parts:
+            continue
         try:
             relative = PurePosixPath(path).relative_to(root)
         except ValueError:
-            continue
-        if ".." in relative.parts:
             continue
         mount_point = Path(point)
         headroom = _cgroup_headroom(mount_point / relative, mount_point, *files)

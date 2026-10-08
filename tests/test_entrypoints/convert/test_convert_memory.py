@@ -350,6 +350,7 @@ def test_cgroup_v2_mount_of_a_subtree(tmp_path):
         # mount roots and paths with ".." are outside this cgroup namespace
         ("/", "/.."),
         ("/../other", "/"),
+        ("/..", "/.."),
     ),
 )
 def test_cgroup_not_visible_through_mount(tmp_path, cgroup, root):
