@@ -3,6 +3,7 @@
 
 import functools
 import inspect
+import threading
 from concurrent.futures import wait
 from contextlib import contextmanager
 from threading import get_ident, local
@@ -231,12 +232,12 @@ def test_cpu_path_preserves_order(_):
     assert out == list(range(10))
 
 
-def _max_in_flight(devices, max_workers, estimates):
-    """Run cpu jobs and return the most jobs the scheduler had in flight at once"""
-    in_flight = []
+def _max_admitted(devices, max_workers, estimates):
+    """Run cpu jobs and return the most jobs the scheduler had admitted at once"""
+    admitted = []
 
     def recording_wait(futures, **kwargs):
-        in_flight.append(len(futures))
+        admitted.append(len(futures))
         return wait(futures, **kwargs)
 
     with patch(_WAIT_TARGET, side_effect=recording_wait):
@@ -244,33 +245,45 @@ def _max_in_flight(devices, max_workers, estimates):
             [lambda dev: dev] * len(estimates), devices, max_workers, estimates
         )
     assert out == [torch.device("cpu")] * len(estimates)
-    return max(in_flight)
+    return max(admitted)
 
 
 @patch(_HOST_TARGET, return_value=10**12)
-def test_cpu_runs_up_to_max_workers_concurrently(_):
-    assert _max_in_flight([torch.device("cpu")], 2, [1] * 6) == 2
+def test_cpu_admits_up_to_max_workers_jobs(_):
+    assert _max_admitted([torch.device("cpu")], 2, [1] * 6) == 2
 
 
 @patch(_HOST_TARGET, return_value=1000)
-def test_cpu_concurrency_is_limited_by_host_memory(_):
+def test_cpu_admission_is_limited_by_host_memory(_):
     # only three 300-byte jobs fit in 1000 bytes, despite max_workers=4
-    assert _max_in_flight([torch.device("cpu")], 4, [300] * 6) == 3
+    assert _max_admitted([torch.device("cpu")], 4, [300] * 6) == 3
 
 
 @patch(_HOST_TARGET, return_value=1000)
 def test_cpu_aliases_share_one_host_memory_budget(_):
     devices = [torch.device("cpu"), torch.device("cpu:0")]
-    assert _max_in_flight(devices, 2, [800, 800]) == 1
+    assert _max_admitted(devices, 2, [800, 800]) == 1
+
+
+@patch(_HOST_TARGET, return_value=10**12)
+def test_cpu_jobs_run_concurrently(_):
+    # each job waits for the other, so both must run at the same time to finish
+    barrier = threading.Barrier(2, timeout=5)
+    jobs = [lambda dev: barrier.wait()] * 2
+    assert sorted(exec_jobs_dynamic(jobs, [torch.device("cpu")], 2, [1, 1])) == [0, 1]
 
 
 @pytest.mark.parametrize("max_workers", (1, 2))
+@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
 @patch(_HOST_TARGET, return_value=100)
-def test_cpu_raises_before_running_jobs_that_exceed_host_memory(_, max_workers):
+@patch(_PATCH_TARGET, return_value=(100, 1000))
+def test_raises_before_running_any_job_if_a_job_cannot_fit(
+    _memory_info, _host, device, max_workers
+):
     ran = []
     jobs = [lambda dev: ran.append(0), lambda dev: ran.append(1)]
     with pytest.raises(RuntimeError, match="Job 1 needs an estimated"):
-        exec_jobs_dynamic(jobs, [torch.device("cpu")], max_workers, [10, 1000])
+        exec_jobs_dynamic(jobs, [torch.device(device)], max_workers, [10, 1000])
     assert ran == []
 
 
@@ -330,12 +343,53 @@ def test_cgroup_v2_mount_of_a_subtree(tmp_path):
     assert _cgroup_available_bytes(*files) == 1000
 
 
-def test_cgroup_not_visible_through_mount(tmp_path):
+@pytest.mark.parametrize(
+    ("cgroup", "root"),
+    (
+        ("/other", "/tenant"),
+        # mount roots and paths with ".." are outside this cgroup namespace
+        ("/", "/.."),
+        ("/../other", "/"),
+    ),
+)
+def test_cgroup_not_visible_through_mount(tmp_path, cgroup, root):
     cg = tmp_path / "cg"
     _write(cg / "memory.max", "1000\n")
     _write(cg / "memory.current", "600\n")
-    files = _proc_files(tmp_path, "0::/other\n", ("cgroup2", "/tenant", cg, "rw"))
+    files = _proc_files(tmp_path, f"0::{cgroup}\n", ("cgroup2", root, cg, "rw"))
     assert _cgroup_available_bytes(*files) is None
+
+
+@pytest.mark.parametrize("first_view_limit", (None, 8000))
+def test_cgroup_takes_smallest_headroom_over_mount_views(tmp_path, first_view_limit):
+    # two mounts of the same hierarchy: the first shows the process's cgroup but
+    # not its memory files (and maybe a looser parent limit), the second shows them
+    first, second = tmp_path / "first", tmp_path / "second"
+    (first / "job").mkdir(parents=True)
+    if first_view_limit is not None:
+        _write(first / "memory.max", f"{first_view_limit}\n")
+        _write(first / "memory.current", "1000\n")
+    _write(second / "job" / "memory.max", "1500\n")
+    _write(second / "job" / "memory.current", "500\n")
+    files = _proc_files(
+        tmp_path,
+        "0::/job\n",
+        ("cgroup2", "/", first, "rw"),
+        ("cgroup2", "/", second, "rw"),
+    )
+    assert _cgroup_available_bytes(*files) == 1000
+
+
+def test_cgroup_mountinfo_escapes(tmp_path):
+    # mountinfo writes spaces in the mount root and mount point as "\040"
+    cg = tmp_path / "cgroup mount"
+    _write(cg / "task" / "memory.max", "1500\n")
+    _write(cg / "task" / "memory.current", "500\n")
+    point = str(cg).replace(" ", "\\040")
+    files = _proc_files(
+        tmp_path, "0::/my job/task\n", ("cgroup2", "/my\\040job", point, "rw")
+    )
+    assert _cgroup_available_bytes(*files) == 1000
 
 
 def test_cgroup_v2_without_limit(tmp_path):

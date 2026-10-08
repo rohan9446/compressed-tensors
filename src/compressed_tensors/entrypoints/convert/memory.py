@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 import sys
 import traceback as tb
 import weakref
@@ -201,6 +202,9 @@ def estimate_job_memory(
     return prof.memory_peak[meta]
 
 
+# mountinfo escapes space, tab, newline and backslash in paths as octal
+_MOUNTINFO_ESCAPE = re.compile(r"\\(040|011|012|134)")
+
 # limit file, usage file and reclaimable `memory.stat` key of each cgroup version
 _V1_MEMORY_FILES = (
     "memory.limit_in_bytes",
@@ -208,6 +212,10 @@ _V1_MEMORY_FILES = (
     "total_inactive_file",
 )
 _V2_MEMORY_FILES = ("memory.max", "memory.current", "inactive_file")
+
+
+def _unescape_mountinfo(field: str) -> str:
+    return _MOUNTINFO_ESCAPE.sub(lambda match: chr(int(match[1], 8)), field)
 
 
 def _read_int(path: Path) -> Optional[int]:
@@ -235,10 +243,12 @@ def _cgroup_available_bytes(
     """
     Estimated memory this process can still allocate under the cgroup memory limits
     it can read: the smallest `limit - (usage - inactive file cache)` over the
-    process's cgroup and its ancestors that are visible through the cgroup mount.
-    Supports cgroup v2 and the v1 memory controller. Ancestors outside the mount
-    (e.g. above a container's cgroup namespace) cannot be read, so their limits and
-    their other members' usage are not taken into account.
+    process's cgroup and its ancestors, as seen through every mount of the cgroup
+    hierarchy. Supports cgroup v2 and the v1 memory controller. Ancestors outside
+    the mounts (e.g. above a container's cgroup namespace) cannot be read, so their
+    limits and their other members' usage are not taken into account, and a cgroup
+    outside this process's cgroup namespace (a path or mount root with "..") is not
+    resolved.
 
     :return: available bytes, or None if no cgroup memory limit could be read
     """
@@ -257,7 +267,8 @@ def _cgroup_available_bytes(
         fields, _, fs_fields = line.partition(" - ")
         fields, fs_fields = fields.split(), fs_fields.split()
         if len(fields) >= 5 and len(fs_fields) >= 3:
-            mounts.append((fs_fields[0], fs_fields[2].split(","), fields[3], fields[4]))
+            root, point = _unescape_mountinfo(fields[3]), _unescape_mountinfo(fields[4])
+            mounts.append((fs_fields[0], fs_fields[2].split(","), root, point))
 
     v1 = [
         path for _, controllers, path in entries if "memory" in controllers.split(",")
@@ -279,18 +290,22 @@ def _cgroup_available_bytes(
         return None
 
     # a mount exposes the hierarchy below its root, so resolve the process's cgroup
-    # relative to that root; prefer the mount that exposes the most ancestors
-    for root, point in sorted(candidates, key=lambda candidate: len(candidate[0])):
+    # relative to that root. Mounts may expose different parts of the hierarchy or
+    # hide some files, so take the smallest headroom over all of them
+    available = None
+    for root, point in candidates:
         try:
             relative = PurePosixPath(path).relative_to(root)
         except ValueError:
             continue
+        if ".." in relative.parts:
+            continue
         mount_point = Path(point)
-        leaf = mount_point / relative
-        if leaf.is_dir():
-            return _cgroup_headroom(leaf, mount_point, *files)
+        headroom = _cgroup_headroom(mount_point / relative, mount_point, *files)
+        if headroom is not None:
+            available = headroom if available is None else min(available, headroom)
 
-    return None
+    return available
 
 
 def _cgroup_headroom(
@@ -506,6 +521,9 @@ def exec_jobs_dynamic(
             if not inflight:
                 if not pending:
                     break
+                # unreachable while every job passes the up-front check (with
+                # nothing in flight, nothing is reserved); guards against waiting
+                # on no futures in a busy loop if scheduling changes
                 raise RuntimeError(
                     "No device has enough estimated free memory for any "
                     "remaining job"
