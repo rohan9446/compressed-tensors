@@ -16,14 +16,11 @@ class DistributedDiskCache(BatchedOffloadMixin, DiskCache):
     `compressed_tensors.offload.cache.disk_cache::DiskCache`.
     """
 
-    def offload_local(
-        self, tensor: torch.Tensor, memo: Optional[dict] = None
-    ) -> tuple[torch.Tensor, list]:
+    def offload_local(self, tensor: torch.Tensor) -> tuple[torch.Tensor, list]:
         """
         Write tensor data to disk on the source rank.
 
         :param tensor: tensor on any device
-        :param memo: unused, accepted for interface compatibility
         :return: meta tensor representing the disk offloaded tensor, and the file
             location, dtype and shape used by other ranks to rebuild it
         """

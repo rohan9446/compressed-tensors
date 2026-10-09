@@ -16,17 +16,11 @@ class DistributedCPUCache(BatchedOffloadMixin, CPUCache):
     """
 
     @catch_cpu_mem_error
-    def offload_local(
-        self, tensor: torch.Tensor, memo: Optional[dict] = None
-    ) -> tuple[torch.Tensor, list]:
+    def offload_local(self, tensor: torch.Tensor) -> tuple[torch.Tensor, list]:
         """
         Create shared cpu memory for offload on the source rank.
 
         :param tensor: tensor on any device
-        :param memo: optional per-batch memo. A tensor whose storage was already
-            shared in this batch (e.g. a tied weight) reuses that handle instead of
-            being shared again: re-sharing moves the data to new shared memory and
-            releases the file that other ranks have not opened yet
         :return: cpu tensor whose data is located in shared memory, and the shared
             memory handle, dtype and shape used by other ranks to rebuild it
         """
@@ -34,19 +28,11 @@ class DistributedCPUCache(BatchedOffloadMixin, CPUCache):
         tensor = tensor.contiguous()
         tensor = CPUCache.offload(self, tensor)
 
-        # look up before sharing: `share_memory_` would re-share the storage. A hit
-        # is a live shared storage (held by an earlier offload), never a freed one
-        if memo is not None:
-            handle = memo.get(("shared", tensor.untyped_storage().data_ptr()))
-            if handle is not None:
-                return tensor, [*handle, tensor.dtype, tensor.shape]
-
-        tensor = tensor.share_memory_()
-        storage = tensor.untyped_storage()
-        handle = storage._share_filename_cpu_()
-        if memo is not None and storage.nbytes() > 0:
-            memo[("shared", storage.data_ptr())] = handle
-
+        # share by filename directly. Storage already shared by filename (e.g. a tied
+        # weight offloaded twice) keeps its handle, whereas `share_memory_` would move
+        # it into new shared memory under the default `file_descriptor` strategy,
+        # releasing a file that other ranks may not have opened yet
+        handle = tensor.untyped_storage()._share_filename_cpu_()
         return tensor, [*handle, tensor.dtype, tensor.shape]
 
     @catch_cpu_mem_error
@@ -76,11 +62,12 @@ class DistributedCPUCache(BatchedOffloadMixin, CPUCache):
         else:
             tensor = send_tensors(tensor, device=self.offload_device)
 
-        storage = memo.get(("storage", handle[1])) if memo is not None else None
+        # handle[1] is the shared memory filename
+        storage = memo.get(handle[1]) if memo is not None else None
         if storage is None:
             storage = torch.UntypedStorage._new_shared_filename_cpu(*handle)
             if memo is not None:
-                memo[("storage", handle[1])] = storage
+                memo[handle[1]] = storage
 
         # reconstruct tensor from shared memory file handle
         with torch.no_grad():

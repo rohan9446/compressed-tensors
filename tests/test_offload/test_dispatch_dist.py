@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import copy
 from unittest.mock import patch
 
 import pytest
@@ -158,19 +159,53 @@ def test_dispatch_rebuilds_dtype_and_shape(accel_device, offload_folder):
 @pytest.mark.unit
 @requires_gpu(2)
 @torchrun(world_size=2, init_dist=True)
-def test_dispatch_modules_missing_on_some_ranks(accel_device):
-    model = _linears(3, meta=not is_source_process())
-    if not is_source_process():
-        model[0] = None  # e.g. a routed expert this rank does not own
+def test_dispatch_modules_missing_on_some_ranks(accel_device, offload_folder):
+    for offload_device in (CPU, "disk"):
+        model = _linears(3, meta=not is_source_process())
+        if not is_source_process():
+            model[0] = None  # e.g. a routed expert this rank does not own
 
-    device_map = {str(i): (accel_device, CPU) for i in range(3)}
-    with _count_collectives() as (broadcast_object_list, _):
-        dispatch_with_map(model, device_map, show_progress=False)
+        device_map = {str(i): (accel_device, offload_device) for i in range(3)}
+        with _count_collectives() as (broadcast_object_list, _):
+            dispatch_with_map(
+                model, device_map, offload_dir=offload_folder, show_progress=False
+            )
+
+        assert broadcast_object_list.call_count == 1
+        expected = _linears(3)
+        if not is_source_process():
+            expected[0] = None
+        _assert_matches(model, expected)
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_mixed_map_with_missing_modules(accel_device, offload_folder):
+    model = _linears(4, meta=not is_source_process())
+    if not is_source_process():
+        model[0] = None
+        model[1] = None
+
+    # cpu and disk modules are missing on other ranks; accelerator modules are not,
+    # since their per-tensor data broadcasts need every rank
+    device_map = {
+        "0": (accel_device, CPU),
+        "1": (accel_device, "disk"),
+        "2": (accel_device, accel_device),
+        "3": (accel_device, CPU),
+    }
+    with _count_collectives() as (broadcast_object_list, barrier):
+        dispatch_with_map(
+            model, device_map, offload_dir=offload_folder, show_progress=False
+        )
 
     assert broadcast_object_list.call_count == 1
-    expected = _linears(3)
+    assert barrier.call_count == 1
+    expected = _linears(4)
     if not is_source_process():
         expected[0] = None
+        expected[1] = None
     _assert_matches(model, expected)
 
 
@@ -194,21 +229,24 @@ def test_offload_after_dispatch_syncs_per_tensor(accel_device):
 @pytest.mark.unit
 @requires_gpu(2)
 @torchrun(world_size=2, init_dist=True)
-def test_dispatch_replica_without_local_modules(accel_device):
-    model = _linears(2, meta=not is_source_process())
-    if not is_source_process():
-        model[0] = None
-        model[1] = None
+def test_dispatch_replica_without_local_modules(accel_device, offload_folder):
+    for offload_device in (CPU, "disk"):
+        model = _linears(2, meta=not is_source_process())
+        if not is_source_process():
+            model[0] = None
+            model[1] = None
 
-    device_map = {str(i): (accel_device, CPU) for i in range(2)}
-    with _count_collectives() as (broadcast_object_list, barrier):
-        dispatch_with_map(model, device_map, show_progress=False)
+        device_map = {str(i): (accel_device, offload_device) for i in range(2)}
+        with _count_collectives() as (broadcast_object_list, barrier):
+            dispatch_with_map(
+                model, device_map, offload_dir=offload_folder, show_progress=False
+            )
 
-    # a rank with nothing to rebuild still joins the single exchange
-    assert broadcast_object_list.call_count == 1
-    assert barrier.call_count == 1
-    if is_source_process():
-        _assert_matches(model, _linears(2))
+        # a rank with nothing to rebuild still joins the single exchange
+        assert broadcast_object_list.call_count == 1
+        assert barrier.call_count == 1
+        if is_source_process():
+            _assert_matches(model, _linears(2))
 
 
 @pytest.mark.unit
@@ -246,10 +284,7 @@ def test_failed_batch_resets_state(accel_device):
     _assert_matches(model, _linears(2))
 
 
-@pytest.mark.unit
-@requires_gpu(3)
-@torchrun(world_size=3, init_dist=True)
-def test_dispatch_three_ranks_non_default_source(accel_device, offload_folder):
+def _test_non_default_source(accel_device, offload_folder):
     with set_source_process(1):
         for offload_device in (CPU, "disk"):
             model = _linears(4, meta=not is_source_process())
@@ -263,3 +298,89 @@ def test_dispatch_three_ranks_non_default_source(accel_device, offload_folder):
             assert broadcast_object_list.call_count == 1
             assert barrier.call_count == 1
             _assert_matches(model, _linears(4))
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_non_default_source(accel_device, offload_folder):
+    _test_non_default_source(accel_device, offload_folder)
+
+
+@pytest.mark.unit
+@requires_gpu(3)
+@torchrun(world_size=3, init_dist=True)
+def test_dispatch_three_ranks_non_default_source(accel_device, offload_folder):
+    _test_non_default_source(accel_device, offload_folder)
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_shared_empty_buffer(accel_device):
+    class SharedEmpty(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            empty = torch.empty(0)
+            self.register_buffer("a", empty)
+            self.register_buffer("b", empty)
+
+    with torch.device("cpu" if is_source_process() else "meta"):
+        model = SharedEmpty()
+
+    # the second offload of the shared zero-byte storage must not invalidate the
+    # first one's handle before other ranks open it
+    dispatch_with_map(model, {"": (accel_device, CPU)}, show_progress=False)
+
+    assert model.a.shape == model.b.shape == (0,)
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_keeps_identity_of_cpu_tensors(accel_device):
+    # tensors already on cpu are rebuilt in place on every rank, so references to
+    # them stay valid (e.g. across a to_accelerate / from_accelerate round trip)
+    model = _linears(2)
+    before = dict(model.named_parameters())
+    device_map = {str(i): (accel_device, CPU) for i in range(2)}
+    dispatch_with_map(model, device_map, show_progress=False)
+
+    with disable_onloading():
+        after = dict(model.named_parameters())
+    assert all(after[name] is tensor for name, tensor in before.items())
+    _assert_matches(model, _linears(2))
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_frees_replica_tensors_before_onloading(accel_device):
+    torch.manual_seed(0)
+    expected = torch.nn.ModuleList(
+        torch.nn.Linear(1024, 2048, bias=False) for _ in range(4)
+    )
+    module_bytes = expected[0].weight.nbytes
+
+    # every rank starts with modules 0-1 on the accelerator and 2-3 on cpu. 0-1 are
+    # offloaded to cpu, then 2-3 are moved onto the accelerator
+    model = copy.deepcopy(expected)
+    model[0].to(accel_device)
+    model[1].to(accel_device)
+    device_map = {
+        "0": (accel_device, CPU),
+        "1": (accel_device, CPU),
+        "2": (accel_device, accel_device),
+        "3": (accel_device, accel_device),
+    }
+
+    torch.accelerator.synchronize()
+    start = torch.accelerator.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
+    dispatch_with_map(model, device_map, show_progress=False)
+    peak = torch.accelerator.max_memory_allocated()
+
+    # the accelerator copies of 0-1 are released as they are offloaded, so moving
+    # 2-3 onto the accelerator does not add to the starting footprint
+    assert peak - start < module_bytes
+    _assert_matches(model, expected)

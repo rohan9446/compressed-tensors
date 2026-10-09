@@ -189,13 +189,6 @@ def test_distributed_async_update(onload_device):
 def test_distributed_offload_logs_memory_hint(onload_device):
     cache = DistributedCPUCache(onload_device)
 
-    original_share_memory = torch.Tensor.share_memory_
-
-    def raise_memory_error(*args, **kwargs):
-        raise RuntimeError("mmap failed: Cannot allocate memory")
-
-    torch.Tensor.share_memory_ = raise_memory_error
-
     warnings = []
     handler_id = loguru_logger.add(
         lambda msg: warnings.append(msg.record["message"]), level="WARNING"
@@ -206,10 +199,16 @@ def test_distributed_offload_logs_memory_hint(onload_device):
         # dist.broadcast barrier. This cleanly avoids the hang since Rank 1
         # safely exits without waiting.
         if dist.get_rank() == 0:
-            with pytest.raises(RuntimeError, match="Cannot allocate memory"):
+            with (
+                patch.object(
+                    torch.UntypedStorage,
+                    "_share_filename_cpu_",
+                    side_effect=RuntimeError("mmap failed: Cannot allocate memory"),
+                ),
+                pytest.raises(RuntimeError, match="Cannot allocate memory"),
+            ):
                 cache.offload(torch.zeros(1, device=onload_device))
     finally:
-        torch.Tensor.share_memory_ = original_share_memory
         loguru_logger.remove(handler_id)
 
     if dist.get_rank() == 0:

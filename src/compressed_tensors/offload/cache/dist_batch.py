@@ -13,6 +13,7 @@ from compressed_tensors.distributed import (
     is_distributed,
     is_source_process,
 )
+from compressed_tensors.offload.utils import to_tensor
 
 
 if TYPE_CHECKING:
@@ -29,7 +30,9 @@ class OffloadBatch:
 
     On the source rank, tensors are offloaded immediately and their metadata is
     recorded. On other ranks, tensors are recorded and rebuilt from the source's
-    metadata when the batch completes. Entries are keyed by module and tensor name, so
+    metadata when the batch completes. Tensors on a device other than the offload
+    device (e.g. an accelerator) are recorded as meta templates, so that their data
+    can be freed during dispatch. Entries are keyed by module and tensor name, so
     ranks which lack some modules (e.g. sharded experts) only rebuild their own.
 
     The source rank is fixed when the batch is created.
@@ -48,7 +51,7 @@ class OffloadBatch:
         self.pending: list[
             tuple["BatchedOffloadMixin", tuple[str, Hashable], Hashable, torch.Tensor]
         ] = []
-        # per-batch memo used by caches to de-duplicate shared storages
+        # other ranks: per-batch memo used by caches to share rebuilt storages
         self.memo: dict = {}
 
     def offload(
@@ -60,7 +63,7 @@ class OffloadBatch:
         :param cache: cache which the tensor belongs to
         :param name: name of the tensor within its cache
         :param tensor: tensor to offload
-        :return: offloaded tensor on the source rank, a placeholder on other ranks
+        :return: offloaded tensor on the source rank. On other ranks, a placeholder
             which is replaced when the batch completes
         """
         if tensor is None:
@@ -76,8 +79,14 @@ class OffloadBatch:
         self.keys.add(key)
 
         if self.is_source:
-            offloaded, self.metadata[key] = cache.offload_local(tensor, memo=self.memo)
+            offloaded, self.metadata[key] = cache.offload_local(tensor)
             return offloaded
+
+        # meta tensors and tensors already on the offload device are rebuilt in place,
+        # keeping their identity. Of tensors elsewhere (e.g. on an accelerator), keep
+        # only a meta template, so that their data can be freed during dispatch
+        if not (tensor.is_meta or str(tensor.device) == str(cache.offload_device)):
+            tensor = _meta_template(tensor)
 
         self.pending.append((cache, key, name, tensor))
         return tensor
@@ -104,6 +113,15 @@ class OffloadBatch:
                 )
 
         dist.barrier()
+
+
+def _meta_template(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Meta tensor with the dtype, shape, class and attributes of `tensor`, but without
+    a reference to its data
+    """
+    template = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+    return to_tensor(template, tensor)
 
 
 _active_batch: Optional[OffloadBatch] = None
@@ -156,14 +174,11 @@ class BatchedOffloadMixin:
     offloaded_values: dict[Hashable, torch.Tensor]
 
     @abstractmethod
-    def offload_local(
-        self, tensor: torch.Tensor, memo: Optional[dict] = None
-    ) -> tuple[torch.Tensor, Any]:
+    def offload_local(self, tensor: torch.Tensor) -> tuple[torch.Tensor, Any]:
         """
         Offload a tensor on the source rank without synchronizing
 
         :param tensor: tensor to offload
-        :param memo: optional per-batch memo for de-duplicating shared storages
         :return: offloaded tensor and the metadata other ranks need to rebuild it
         """
         raise NotImplementedError()
@@ -177,7 +192,7 @@ class BatchedOffloadMixin:
 
         :param tensor: this rank's local tensor (often a meta tensor)
         :param metadata: metadata returned by `offload_local` on the source rank
-        :param memo: optional per-batch memo for de-duplicating shared storages
+        :param memo: optional per-batch memo for sharing rebuilt storages
         :return: offloaded tensor referring to the source rank's offload
         """
         raise NotImplementedError()
