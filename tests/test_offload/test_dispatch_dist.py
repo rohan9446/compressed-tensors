@@ -37,6 +37,18 @@ def _assert_matches(model: torch.nn.Module, expected: torch.nn.Module):
             assert torch.equal(actual.cpu(), tensor), name
 
 
+def _assert_offloads_match_across_ranks(model: torch.nn.Module):
+    """Offloaded tensors have the same gradient flags and strides on every rank"""
+    with disable_onloading():
+        local = {
+            name: (tensor.requires_grad, tensor.stride())
+            for name, tensor in model.state_dict(keep_vars=True).items()
+        }
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    assert all(flags == gathered[0] for flags in gathered)
+
+
 @contextlib.contextmanager
 def _count_collectives():
     with (
@@ -355,6 +367,23 @@ def test_dispatch_keeps_identity_of_cpu_tensors(accel_device):
 @pytest.mark.unit
 @requires_gpu(2)
 @torchrun(world_size=2, init_dist=True)
+def test_dispatch_replica_offloads_match_source(accel_device, offload_folder):
+    for offload_device in (CPU, "disk"):
+        # every rank holds real cpu tensors: parameters which require grad, and a
+        # non-contiguous buffer
+        model = _linears(2)
+        model[0].register_buffer("transposed", torch.arange(6.0).reshape(2, 3).t())
+        device_map = {str(i): (accel_device, offload_device) for i in range(2)}
+        dispatch_with_map(
+            model, device_map, offload_dir=offload_folder, show_progress=False
+        )
+
+        _assert_offloads_match_across_ranks(model)
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
 def test_dispatch_frees_replica_tensors_before_onloading(accel_device):
     torch.manual_seed(0)
     expected = torch.nn.ModuleList(
@@ -384,3 +413,4 @@ def test_dispatch_frees_replica_tensors_before_onloading(accel_device):
     # 2-3 onto the accelerator does not add to the starting footprint
     assert peak - start < module_bytes
     _assert_matches(model, expected)
+    _assert_offloads_match_across_ranks(model)
