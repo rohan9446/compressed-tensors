@@ -85,8 +85,9 @@ class OffloadBatch:
         # a tensor on a device other than the offload device (e.g. an accelerator) is
         # rebuilt as a new tensor either way, so keep only a meta copy of it (made the
         # way `recv_offload` copies tensors) and let its data be freed during dispatch.
-        # Tensors already on the offload device are kept and rebuilt in place, as
-        # without batching
+        # Like other moved tensors, its offload doesn't require grad, also when its
+        # dtype or shape differs from the source's. Tensors already on the offload
+        # device are kept and rebuilt in place, as without batching
         if not (tensor.is_meta or str(tensor.device) == str(cache.offload_device)):
             tensor = send_tensors(tensor, device="meta")
 

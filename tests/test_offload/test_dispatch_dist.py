@@ -414,3 +414,61 @@ def test_dispatch_frees_replica_tensors_before_onloading(accel_device):
     assert peak - start < module_bytes
     _assert_matches(model, expected)
     _assert_offloads_match_across_ranks(model)
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_records_empty_views_as_meta(accel_device, offload_folder):
+    class EmptyView(torch.nn.Module):
+        def __init__(self, device: torch.device):
+            super().__init__()
+            self.register_buffer("view", torch.empty(1024, device=device)[:0])
+
+    recorded = []
+    original_complete = dist_batch.OffloadBatch.complete
+
+    def complete(batch: dist_batch.OffloadBatch):
+        recorded.extend(tensor for *_, tensor in batch.pending)
+        original_complete(batch)
+
+    # an empty view on a device other than the offload device is recorded as a meta
+    # copy on non-source ranks, so the batch doesn't keep its allocation alive
+    for offload_device, view_device in (("disk", CPU), (CPU, accel_device)):
+        recorded.clear()
+        model = EmptyView(view_device)
+        with patch.object(dist_batch.OffloadBatch, "complete", complete):
+            dispatch_with_map(
+                model,
+                {"": (accel_device, offload_device)},
+                offload_dir=offload_folder,
+                show_progress=False,
+            )
+
+        assert len(recorded) == (0 if is_source_process() else 1)
+        assert all(tensor.is_meta for tensor in recorded)
+        with disable_onloading():
+            offloaded = model.view
+        assert offloaded.shape == (0,)
+        assert offloaded.device == (
+            torch.device("meta") if offload_device == "disk" else CPU
+        )
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_dispatch_rebuilds_accelerator_tensors_with_other_shape(accel_device):
+    # a non-source rank's accelerator weight with a different shape than the
+    # source's is rebuilt from the source. Like any tensor moved off the
+    # accelerator, its offload doesn't require grad, so every rank matches
+    model = _linears(1).to(accel_device)
+    if not is_source_process():
+        model[0].weight = torch.nn.Parameter(torch.zeros(2, 4, device=accel_device))
+
+    dispatch_with_map(model, {"0": (accel_device, CPU)}, show_progress=False)
+
+    _assert_matches(model, _linears(1))
+    _assert_offloads_match_across_ranks(model)
+    with disable_onloading():
+        assert not model[0].weight.requires_grad
